@@ -1,0 +1,7 @@
+# downloaded Sentinel-2 data (re-downloadable)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
