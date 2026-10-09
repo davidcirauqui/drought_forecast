@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy import stats
-import requests
+from pathlib import Path
 
 from sentinelhub import (
     BBox,
@@ -11,11 +10,43 @@ from sentinelhub import (
     SentinelHubRequest,
     DataCollection,
     MimeType,
-    MosaickingOrder,
 )
 
 
-def get_ndmi(coords, resolution, dates, config):
+def _fmt_coord(value, pos, neg, ndigits):
+    """
+    function that converts coordinates with negatives values to cardinal directions
+    example: 2.97 -> '2.97E', -0.5 -> '0.50W'
+    """
+    return f"{abs(value):.{ndigits}f}{pos if value >= 0 else neg}"
+
+def make_data_folder(bbox_coords, time_interval, root="data/raw/s2", ndigits=2):
+    """
+    function that gives a data_folder name based on coordinates and dates
+    Inputs:
+        - bbox_coords:   [min_lon, min_lat, max_lon, max_lat] in WGS84
+        - time_interval: (start, end) as 'YYYY-MM-DD' strings or datetimes
+    Outputs:
+        - folder name: example data/raw/s2/2.97E-3.19E_41.92N-42.10N/2023-07
+    """
+
+    min_lon, min_lat, max_lon, max_lat = bbox_coords
+    area = (f"{_fmt_coord(min_lon, 'E', 'W', ndigits)}-{_fmt_coord(max_lon, 'E', 'W', ndigits)}_"
+            f"{_fmt_coord(min_lat, 'N', 'S', ndigits)}-{_fmt_coord(max_lat, 'N', 'S', ndigits)}")
+
+    start, end = (pd.Timestamp(t).normalize() for t in time_interval)
+    # If period spans exactly one calendar month -> '2023-07', 
+    # otherwise '2023-07-01_2023-07-15'
+    if start.day == 1 and end == start + pd.offsets.MonthEnd(0):
+        period = start.strftime("%Y-%m")
+    else:
+        period = f"{start:%Y-%m-%d}_{end:%Y-%m-%d}"
+
+    return str(Path(root) / area / period)
+
+
+
+def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False):
     """Function that returns the monthly median NDMI index, after filtering out
       clouds, shadows, water and snow
     inputs:
@@ -23,6 +54,8 @@ def get_ndmi(coords, resolution, dates, config):
         - resolution: Resolution of the requested data
         - dates: Dates delimiting the time span over which the data is requested.
         - config: SentinelHub configuration
+        - save_data: boolean determining whether to save requested data on disk
+        - redownload: boolean determining whether to download data again (takes data from saved if not)
     outputs:
         - ndmi_mat: matrix containing the computed NDMI index over the specified coordinate box and dates
         - df: dataframe with NDMI median values and the total number of clear (non-masked)
@@ -77,10 +110,11 @@ def get_ndmi(coords, resolution, dates, config):
         bbox = m_bbox,
         size = m_size,
         config = config,
+        data_folder = make_data_folder(coords, dates)
     )
 
     # request data from SentinelHub
-    data = request_ndmi.get_data()
+    data = request_ndmi.get_data(save_data = save_data, redownload = redownload)
     n = data[0].reshape(data[0].shape[0] * data[0].shape[1], 2)
     df = pd.DataFrame(n.astype(np.float32))
     df.columns = ['ndmi_median', 'clear_count']
