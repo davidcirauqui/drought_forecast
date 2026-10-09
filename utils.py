@@ -15,15 +15,18 @@ from sentinelhub import (
 )
 
 
-def get_ndmi_mat(coords, resolution, dates, config):
-    """Function that returns the NDMI index
+def get_ndmi(coords, resolution, dates, config):
+    """Function that returns the monthly median NDMI index, after filtering out
+      clouds, shadows, water and snow
     inputs:
         - coords: Coordinate box delimiting the square over which to compute the NDMI index
         - resolution: Resolution of the requested data
-        - dates: Dates delimiting the time span over which the data is requested. The function computes the NDMI index on the less cloudy day within that period of time
+        - dates: Dates delimiting the time span over which the data is requested.
         - config: SentinelHub configuration
     outputs:
-        - ndmi_mat: array containing the computed NDMI index over the specified coordinate box and dates
+        - ndmi_mat: matrix containing the computed NDMI index over the specified coordinate box and dates
+        - df: dataframe with NDMI median values and the total number of clear (non-masked)
+        observations used to compute each of them
     """
 
 
@@ -37,19 +40,25 @@ def get_ndmi_mat(coords, resolution, dates, config):
         //VERSION=3
         function setup() {
             return {
-                input: [{
-                    bands: ["B8A","B11"],
-                    units: "DN"
-                }],
-                output: {
-                    bands: 2,
-                    sampleType: "INT16"
-                }
+                input: [{bands: ["B8A","B11", "SCL", "dataMask"],units: "DN"}],
+                output: {bands: 2, sampleType: "FLOAT32"},
+                mosaicking: "ORBIT"
             };
         }
 
+        // drop clouds and shadows using Scene Classification Band (SCL)
+        // SCL classes kept: 4 = vegetation, 5 = bare soil, 7 = unclass
+        // classes dropped: clouds, shadows, water, snow
+        function isClear(s) { return s.dataMask == 1 && [4, 5, 7].includes(s.SCL);}
+
+        // return median
         function evaluatePixel(sample) {
-            return [sample.B8A, sample.B11];
+          const v = sample.filter(isClear).map(s => (s.B8A - s.B11) / (s.B8A + s.B11));
+          if (v.length == 0) return [NaN, 0];
+          v.sort((a, b) => a - b);
+          const m = Math.floor(v.length / 2);
+          const median = v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+          return [median, v.length];
         }
     """
 
@@ -58,11 +67,10 @@ def get_ndmi_mat(coords, resolution, dates, config):
         evalscript = evalscript_ndmi,
         input_data=[
             SentinelHubRequest.input_data(
-                data_collection=DataCollection.SENTINEL2_L1C.define_from(
-                    "s2l1c", service_url=config.sh_base_url
+                data_collection=DataCollection.SENTINEL2_L2A.define_from(
+                    "s2l2a", service_url=config.sh_base_url
                 ),
                 time_interval=(dates[0], dates[1]),
-                mosaicking_order=MosaickingOrder.LEAST_CC,
             )
         ],
         responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
@@ -73,16 +81,14 @@ def get_ndmi_mat(coords, resolution, dates, config):
 
     # request data from SentinelHub
     data = request_ndmi.get_data()
-
-    # process NIR and SWIR chanels' data into NDMI index
     n = data[0].reshape(data[0].shape[0] * data[0].shape[1], 2)
     df = pd.DataFrame(n.astype(np.float32))
-    df.columns = ['nir', 'swir']
-    df['ndmi'] = (df.nir - df.swir) / (df.nir + df.swir)
-    
+    df.columns = ['ndmi_median', 'clear_count']
+
 
     # reshape into matrix for plotting purposes
-    ndmi_mat = df.ndmi.to_numpy()
+    ndmi_mat = df.ndmi_median.to_numpy()
     ndmi_mat = ndmi_mat.reshape(data[0].shape[0], data[0].shape[1])
 
-    return ndmi_mat
+
+    return ndmi_mat, df
