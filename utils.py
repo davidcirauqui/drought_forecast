@@ -1,12 +1,17 @@
 import numpy as np
 import pandas as pd
+import xarray as xr
 from pathlib import Path
+import shutil
+import zipfile
+import cdsapi
 
 from sentinelhub import (
     BBox,
     bbox_to_dimensions,
     CRS,
     SentinelHubCatalog,
+    SentinelHubDownloadClient,
     SentinelHubRequest,
     DataCollection,
     MimeType,
@@ -45,23 +50,76 @@ def make_data_folder(bbox_coords, time_interval, root="data/raw/s2", ndigits=2):
     return str(Path(root) / area / period)
 
 
+def _month_interval(dates):
+    """
+    function that converts a [year, month] pair into the first and last day of that month
+    example: [2023, 7] -> (Timestamp('2023-07-01'), Timestamp('2023-07-31'))
+    """
+    if len(dates) != 2:
+        raise ValueError(f"dates must be [year, month], got {dates}")
+    year, month = (int(d) for d in dates)
+    if not 1 <= month <= 12:
+        raise ValueError(f"month must be between 1 and 12, got {month}")
 
-def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False):
+    start = pd.Timestamp(year = year, month = month, day = 1)
+    end = start + pd.offsets.MonthEnd(0)
+    return start, end
+
+
+def _month_list(dates):
+    """
+    function that converts a list of [year, month] pairs into sorted, unique (start, end) intervals
+    example: [[2023, 8], [2023, 7]] -> [(2023-07-01, 2023-07-31), (2023-08-01, 2023-08-31)]
+    """
+    if len(dates) == 0 or not isinstance(dates[0], (list, tuple)):
+        raise ValueError(f"dates must be a list of [year, month] pairs, e.g. [[2023, 7]], got {dates}")
+    return sorted({_month_interval(d) for d in dates})
+
+
+def _ndmi_frame(img, start, coords):
+    """
+    function that flattens one monthly NDMI image (height, width, 2) into a dataframe
+    with time, pixel-center lat and lon, NDMI median and clear observation count
+    """
+    height, width = img.shape[:2]
+    df = pd.DataFrame(img.reshape(height * width, 2).astype(np.float32),
+                      columns = ['ndmi_median', 'clear_count'])
+
+    # pixel-center coordinates: the image is on a WGS84 grid,
+    # rows go from north (max_lat) to south, columns from west to east
+    min_lon, min_lat, max_lon, max_lat = coords
+    lons = min_lon + (np.arange(width) + 0.5) * (max_lon - min_lon) / width
+    lats = max_lat - (np.arange(height) + 0.5) * (max_lat - min_lat) / height
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    df.insert(0, 'time', start)
+    df.insert(1, 'lat', lat_grid.ravel())
+    df.insert(2, 'lon', lon_grid.ravel())
+    return df
+
+
+
+def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False,
+             return_data = True, max_threads = 5, batch_size = 20):
     """Function that returns the monthly median NDMI index, after filtering out
       clouds, shadows, water and snow
     inputs:
         - coords: Coordinate box delimiting the square over which to compute the NDMI index
         - resolution: Resolution of the requested data
-        - dates: Dates delimiting the time span over which the data is requested.
+        - dates: list of [[year, month]] dates for which to request data, one request per month
         - config: SentinelHub configuration
         - save_data: boolean determining whether to save requested data on disk
         - redownload: boolean determining whether to download data again (takes data from saved if not)
+        - return_data: boolean determining whether to build and return the dataframe
+        (set to False to only download and save, e.g. the full 2017-2025 period)
+        - max_threads: number of months downloaded in parallel
+        - batch_size: number of months kept in memory at once
     outputs:
-        - ndmi_mat: matrix containing the computed NDMI index over the specified coordinate box and dates
-        - df: dataframe with NDMI median values and the total number of clear (non-masked)
-        observations used to compute each of them
+        - df: dataframe with time, pixel-center lat and lon, monthly NDMI median values and the total
+        number of clear (non-masked) observations used to compute each of them (None if return_data is False)
     """
 
+
+    months = _month_list(dates)
 
     # SentinelHub specifications
     m_bbox = BBox(bbox = coords, crs=CRS.WGS84)
@@ -95,34 +153,139 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
         }
     """
 
-    # define requesting function
-    request_ndmi = SentinelHubRequest(
-        evalscript = evalscript_ndmi,
-        input_data=[
-            SentinelHubRequest.input_data(
-                data_collection=DataCollection.SENTINEL2_L2A.define_from(
-                    "s2l2a", service_url=config.sh_base_url
-                ),
-                time_interval=(dates[0], dates[1]),
-            )
-        ],
-        responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
-        bbox = m_bbox,
-        size = m_size,
-        config = config,
-        data_folder = make_data_folder(coords, dates)
-    )
+    # define requesting function, one request per month
+    def request_ndmi(start, end):
+        return SentinelHubRequest(
+            evalscript = evalscript_ndmi,
+            input_data=[
+                SentinelHubRequest.input_data(
+                    data_collection=DataCollection.SENTINEL2_L2A.define_from(
+                        "s2l2a", service_url=config.sh_base_url
+                    ),
+                    time_interval=(f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"),
+                )
+            ],
+            responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
+            bbox = m_bbox,
+            size = m_size,
+            config = config,
+            data_folder = make_data_folder(coords, (start, end))
+        )
 
-    # request data from SentinelHub
-    data = request_ndmi.get_data(save_data = save_data, redownload = redownload)
-    n = data[0].reshape(data[0].shape[0] * data[0].shape[1], 2)
-    df = pd.DataFrame(n.astype(np.float32))
-    df.columns = ['ndmi_median', 'clear_count']
+    # request data from SentinelHub in parallel, batch by batch to limit memory
+    # (already saved months are read from disk unless redownload is True)
+    client = SentinelHubDownloadClient(config = config, redownload = redownload)
+    dfs = []
+    for i in range(0, len(months), batch_size):
+        batch = months[i:i + batch_size]
+        download_list = []
+        for start, end in batch:
+            dl = request_ndmi(start, end).download_list[0]
+            dl.save_response = save_data
+            download_list.append(dl)
+        data = client.download(download_list, max_threads = max_threads)
+
+        if return_data:
+            for (start, _), img in zip(batch, data):
+                dfs.append(_ndmi_frame(img, start, coords))
+
+    if not return_data:
+        return None
+    return pd.concat(dfs, ignore_index = True)
 
 
-    # reshape into matrix for plotting purposes
-    ndmi_mat = df.ndmi_median.to_numpy()
-    ndmi_mat = ndmi_mat.reshape(data[0].shape[0], data[0].shape[1])
 
 
-    return ndmi_mat, df
+
+def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload = False):
+    """Function that returns ERA5-Land monthly means of requested variables
+    inputs:
+        - coords: Coordinate box delimiting the square over which to download the data [min_lon, min_lat, max_lon, max_lat] in WGS84
+        - dates: list of [[year, month]] dates for which to request data
+        - variables: list of ERA5-Land variable names to download
+        - margin: degrees added around the box, since the ERA5-Land grid is ~9 km
+        - save_data: boolean determining whether to keep the downloaded file on disk
+        - redownload: boolean determining whether to download data again (takes data from saved if not)
+    outputs:
+        - df: dataframe with time, lat, lon and the requested monthly variables for each point in the box
+    """
+
+    months = _month_list(dates)
+    month_paths = {start: Path(make_data_folder(coords, (start, end), root="data/raw/era5")) / "era5_land_monthly.nc"
+                   for start, end in months}
+    missing = [(start, end) for start, end in months if redownload or not month_paths[start].exists()]
+
+    # download all missing months in a single CDS request, then split them into one file per month
+    parts = {}
+    if missing:
+        # CDS area is [N, W, S, E]
+        min_lon, min_lat, max_lon, max_lat = coords
+        area = [max_lat + margin, min_lon - margin, min_lat - margin, max_lon + margin]
+
+        # years x months is a cartesian product, extra months are dropped below
+        request = {
+            "product_type": ["monthly_averaged_reanalysis"],
+            "variable": list(variables),
+            "year": sorted({f"{start.year}" for start, _ in missing}),
+            "month": sorted({f"{start.month:02d}" for start, _ in missing}),
+            "time": ["00:00"],
+            "area": area,
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+        }
+        tmp_dir = month_paths[missing[0][0]].parent.parent / "_cds_download"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = tmp_dir / "era5_land_monthly.nc"
+        cdsapi.Client().retrieve("reanalysis-era5-land-monthly-means", request, str(tmp_path))
+        ds_new = _open_era5(tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        not_available = []
+        for start, end in missing:
+            month_ds = ds_new.sel(time=slice(start, end))
+            if month_ds.time.size == 0:
+                not_available.append(f"{start:%Y-%m}")
+                continue
+            if save_data:
+                month_paths[start].parent.mkdir(parents=True, exist_ok=True)
+                month_ds.to_netcdf(month_paths[start])
+            parts[start] = month_ds
+        if not_available:
+            raise ValueError(f"CDS returned no data for months: {not_available}")
+
+    # read already saved months from disk
+    for start, _ in months:
+        if start not in parts:
+            parts[start] = _open_era5(month_paths[start])
+
+    ds = xr.concat([parts[start] for start, _ in months], dim="time")
+    df = ds.to_dataframe().reset_index().rename(columns={"latitude": "lat", "longitude": "lon"})
+
+    return df
+
+
+def _open_era5(path):
+    """
+    function that loads an ERA5-Land netcdf file (or the zip CDS sometimes returns instead)
+    into memory and normalises its coordinates
+    """
+    # CDS sometimes returns a zip with one .nc per variable group
+    if zipfile.is_zipfile(path):
+        extract_dir = path.parent / "unzipped"
+        with zipfile.ZipFile(path) as z:
+            z.extractall(extract_dir)
+        files = sorted(extract_dir.glob("*.nc"))
+    else:
+        files = [path]
+
+    # load into memory so files are released (needed on Windows before deleting)
+    parts = []
+    for f in files:
+        with xr.open_dataset(f) as part:
+            parts.append(part.load())
+    ds = xr.merge(parts, compat="override")
+
+    # new CDS names the time dimension 'valid_time'
+    if "valid_time" in ds.dims:
+        ds = ds.rename({"valid_time": "time"})
+    return ds.drop_vars(["number", "expver"], errors="ignore")
