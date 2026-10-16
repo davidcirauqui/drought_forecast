@@ -230,9 +230,10 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
             if month_ds.time.size == 0:
                 not_available.append(f"{start:%Y-%m}")
                 continue
+            # saved as NETCDF3: much faster to open than NETCDF4/HDF5 for many small files
             if save_data:
                 month_paths[start].parent.mkdir(parents=True, exist_ok=True)
-                month_ds.to_netcdf(month_paths[start])
+                month_ds.to_netcdf(month_paths[start], format="NETCDF3_64BIT", engine="scipy")
             parts[start] = month_ds
         if not_available:
             raise ValueError(f"CDS returned no data for months: {not_available}")
@@ -240,7 +241,8 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
     # read already saved months from disk
     for start, _ in months:
         if start not in parts:
-            parts[start] = _open_era5(month_paths[start])
+            with xr.open_dataset(month_paths[start], engine="scipy") as month_ds:
+                parts[start] = month_ds.load()
 
     ds = xr.concat([parts[start] for start, _ in months], dim="time")
     ds = ds.rename({"latitude": "lat", "longitude": "lon"})
