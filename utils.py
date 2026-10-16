@@ -11,7 +11,6 @@ from sentinelhub import (
     bbox_to_dimensions,
     CRS,
     SentinelHubCatalog,
-    SentinelHubDownloadClient,
     SentinelHubRequest,
     DataCollection,
     MimeType,
@@ -76,30 +75,31 @@ def _month_list(dates):
     return sorted({_month_interval(d) for d in dates})
 
 
-def _ndmi_frame(img, start, coords):
+def _ndmi_dataset(img, start, coords):
     """
-    function that flattens one monthly NDMI image (height, width, 2) into a dataframe
-    with time, pixel-center lat and lon, NDMI median and clear observation count
+    function that converts one monthly NDMI image (height, width, 2) into a dataset
+    with dimensions (time, lat, lon) and variables NDMI median and clear observation count
     """
     height, width = img.shape[:2]
-    df = pd.DataFrame(img.reshape(height * width, 2).astype(np.float32),
-                      columns = ['ndmi_median', 'clear_count'])
 
     # pixel-center coordinates: the image is on a WGS84 grid,
     # rows go from north (max_lat) to south, columns from west to east
     min_lon, min_lat, max_lon, max_lat = coords
     lons = min_lon + (np.arange(width) + 0.5) * (max_lon - min_lon) / width
     lats = max_lat - (np.arange(height) + 0.5) * (max_lat - min_lat) / height
-    lon_grid, lat_grid = np.meshgrid(lons, lats)
-    df.insert(0, 'time', start)
-    df.insert(1, 'lat', lat_grid.ravel())
-    df.insert(2, 'lon', lon_grid.ravel())
-    return df
+
+    img = img.astype(np.float32)[np.newaxis]
+    return xr.Dataset(
+        {
+            'ndmi_median': (('time', 'lat', 'lon'), img[..., 0]),
+            'clear_count': (('time', 'lat', 'lon'), img[..., 1]),
+        },
+        coords = {'time': [start], 'lat': lats, 'lon': lons},
+    )
 
 
 
-def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False,
-             return_data = True, max_threads = 5, batch_size = 20):
+def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False):
     """Function that returns the monthly median NDMI index, after filtering out
       clouds, shadows, water and snow
     inputs:
@@ -109,13 +109,9 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
         - config: SentinelHub configuration
         - save_data: boolean determining whether to save requested data on disk
         - redownload: boolean determining whether to download data again (takes data from saved if not)
-        - return_data: boolean determining whether to build and return the dataframe
-        (set to False to only download and save, e.g. the full 2017-2025 period)
-        - max_threads: number of months downloaded in parallel
-        - batch_size: number of months kept in memory at once
     outputs:
-        - df: dataframe with time, pixel-center lat and lon, monthly NDMI median values and the total
-        number of clear (non-masked) observations used to compute each of them (None if return_data is False)
+        - ds: xarray Dataset with dimensions (time, lat, lon) on pixel centers, with monthly NDMI median
+        values and the total number of clear (non-masked) observations used to compute each of them
     """
 
 
@@ -172,26 +168,14 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
             data_folder = make_data_folder(coords, (start, end))
         )
 
-    # request data from SentinelHub in parallel, batch by batch to limit memory
+    # request data from SentinelHub month by month
     # (already saved months are read from disk unless redownload is True)
-    client = SentinelHubDownloadClient(config = config, redownload = redownload)
-    dfs = []
-    for i in range(0, len(months), batch_size):
-        batch = months[i:i + batch_size]
-        download_list = []
-        for start, end in batch:
-            dl = request_ndmi(start, end).download_list[0]
-            dl.save_response = save_data
-            download_list.append(dl)
-        data = client.download(download_list, max_threads = max_threads)
+    parts = []
+    for start, end in months:
+        data = request_ndmi(start, end).get_data(save_data = save_data, redownload = redownload)
+        parts.append(_ndmi_dataset(data[0], start, coords))
 
-        if return_data:
-            for (start, _), img in zip(batch, data):
-                dfs.append(_ndmi_frame(img, start, coords))
-
-    if not return_data:
-        return None
-    return pd.concat(dfs, ignore_index = True)
+    return xr.concat(parts, dim = 'time')
 
 
 
@@ -207,7 +191,7 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
         - save_data: boolean determining whether to keep the downloaded file on disk
         - redownload: boolean determining whether to download data again (takes data from saved if not)
     outputs:
-        - df: dataframe with time, lat, lon and the requested monthly variables for each point in the box
+        - ds: xarray Dataset with dimensions (time, lat, lon) and the requested monthly variables
     """
 
     months = _month_list(dates)
@@ -259,9 +243,9 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
             parts[start] = _open_era5(month_paths[start])
 
     ds = xr.concat([parts[start] for start, _ in months], dim="time")
-    df = ds.to_dataframe().reset_index().rename(columns={"latitude": "lat", "longitude": "lon"})
+    ds = ds.rename({"latitude": "lat", "longitude": "lon"})
 
-    return df
+    return ds
 
 
 def _open_era5(path):
