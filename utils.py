@@ -5,6 +5,13 @@ from pathlib import Path
 import shutil
 import zipfile
 import cdsapi
+import rioxarray
+from rasterio.enums import Resampling
+from rasterio.errors import RasterioIOError
+from rasterio.transform import from_bounds
+from rioxarray.exceptions import NoDataInBounds
+from rioxarray.merge import merge_arrays
+
 
 from sentinelhub import (
     BBox,
@@ -108,7 +115,7 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
         - dates: list of [[year, month]] dates for which to request data, one request per month
         - config: SentinelHub configuration
         - save_data: boolean determining whether to save requested data on disk
-        - redownload: boolean determining whether to download data again (takes data from saved if not)
+        - redownload: boolean determining whether to download data again (gets data saved on disk if not)
     outputs:
         - ds: xarray Dataset with dimensions (time, lat, lon) on pixel centers, with monthly NDMI median
         values and the total number of clear (non-masked) observations used to compute each of them
@@ -189,7 +196,7 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
         - variables: list of ERA5-Land variable names to download
         - margin: degrees added around the box, since the ERA5-Land grid is ~9 km
         - save_data: boolean determining whether to keep the downloaded file on disk
-        - redownload: boolean determining whether to download data again (takes data from saved if not)
+        - redownload: boolean determining whether to download data again (gets data saved on disk if not)
     outputs:
         - ds: xarray Dataset with dimensions (time, lat, lon) and the requested monthly variables
     """
@@ -275,3 +282,281 @@ def _open_era5(path):
     if "valid_time" in ds.dims:
         ds = ds.rename({"valid_time": "time"})
     return ds.drop_vars(["number", "expver"], errors="ignore")
+
+
+
+
+
+def _area_name(bbox_coords, ndigits=2):
+    """
+    function that gives a folder name for a coordinate box
+    example: [2.97, 41.92, 3.19, 42.10] -> '2.97E-3.19E_41.92N-42.10N'
+    """
+    min_lon, min_lat, max_lon, max_lat = bbox_coords
+    return (f"{_fmt_coord(min_lon, 'E', 'W', ndigits)}-{_fmt_coord(max_lon, 'E', 'W', ndigits)}_"
+            f"{_fmt_coord(min_lat, 'N', 'S', ndigits)}-{_fmt_coord(max_lat, 'N', 'S', ndigits)}")
+
+
+def _get_cog_mosaic(urls, coords, raw_path, save_data, redownload):
+    """
+    function that reads the window over coords from several Cloud-Optimised GeoTIFF tiles and merges them,
+    or reads the merged map from raw_path if it was already saved
+    outputs:
+        - da: xarray DataArray with dimensions (lat, lon) at the native resolution of the tiles
+    """
+    if redownload or not raw_path.exists():
+        parts = []
+        for url in urls:
+            try:
+                da = rioxarray.open_rasterio(url)
+                parts.append(da.rio.clip_box(*coords).load())
+            # ocean-only tiles don't exist, and a tile can touch the box only on its edge
+            except (RasterioIOError, NoDataInBounds):
+                continue
+        da = merge_arrays(parts)
+        if save_data:
+            raw_path.parent.mkdir(parents = True, exist_ok = True)
+            da.rio.to_raster(raw_path, compress = "deflate")
+    else:
+        with rioxarray.open_rasterio(raw_path) as src:
+            da = src.load()
+
+    return da.squeeze("band", drop = True).rename({"y": "lat", "x": "lon"}).drop_vars("spatial_ref")
+
+
+def _dem_tiles(coords):
+    """
+    function that gives the names of the 1x1 degree Copernicus DEM tiles covering a coordinate box,
+    tiles are named after their south-west corner
+    example: [2.97, 41.92, 3.19, 42.10] -> ['Copernicus_DSM_COG_10_N41_00_E002_00_DEM', ...] (4 tiles)
+    """
+    min_lon, min_lat, max_lon, max_lat = coords
+    tiles = []
+    for lat in range(int(np.floor(min_lat)), int(np.floor(max_lat)) + 1):
+        for lon in range(int(np.floor(min_lon)), int(np.floor(max_lon)) + 1):
+            ns = f"{'N' if lat >= 0 else 'S'}{abs(lat):02d}_00"
+            ew = f"{'E' if lon >= 0 else 'W'}{abs(lon):03d}_00"
+            tiles.append(f"Copernicus_DSM_COG_10_{ns}_{ew}_DEM")
+    return tiles
+
+
+def get_dem(coords, save_data = True, redownload = False):
+    """Function that returns the Copernicus DEM (GLO-30) at its native ~30 m resolution
+    inputs:
+        - coords: Coordinate box [min_lon, min_lat, max_lon, max_lat] in WGS84
+        - save_data: boolean determining whether to save the DEM on disk
+        - redownload: boolean determining whether to download data again (gets data saved on disk if not)
+    outputs:
+        - ds: xarray Dataset with dimensions (lat, lon) and variable elevation in metres above sea level
+    """
+
+    # public Cloud-Optimised GeoTIFFs of the 30 m Copernicus DEM on AWS, only the window over coords is read
+    # (on CDSE Sentinel Hub the 30 m DEM is restricted to registered CCM users)
+    urls = [f"https://copernicus-dem-30m.s3.amazonaws.com/{tile}/{tile}.tif" for tile in _dem_tiles(coords)]
+    raw_path = Path("data/raw/dem") / _area_name(coords) / "copernicus_dem_30.tif"
+
+    elevation = _get_cog_mosaic(urls, coords, raw_path, save_data, redownload)
+    return elevation.astype(np.float32).to_dataset(name = "elevation")
+
+
+
+WORLDCOVER_CLASSES = {
+    10: "tree_cover",
+    20: "shrubland",
+    30: "grassland",
+    40: "cropland",
+    50: "built_up",
+    60: "bare_sparse",
+    70: "snow_ice",
+    80: "water",
+    90: "herbaceous_wetland",
+    95: "mangroves",
+    100: "moss_lichen",
+}
+
+
+def _worldcover_tiles(coords):
+    """
+    function that gives the names of the 3x3 degree WorldCover tiles covering a coordinate box,
+    tiles are named after their south-west corner
+    example: [2.97, 41.92, 3.19, 42.10] -> ['N39E000', 'N39E003', 'N42E000', 'N42E003']
+    """
+    min_lon, min_lat, max_lon, max_lat = coords
+    tiles = []
+    for lat in range(int(np.floor(min_lat / 3)) * 3, int(np.floor(max_lat / 3)) * 3 + 1, 3):
+        for lon in range(int(np.floor(min_lon / 3)) * 3, int(np.floor(max_lon / 3)) * 3 + 1, 3):
+            tiles.append(f"{'N' if lat >= 0 else 'S'}{abs(lat):02d}{'E' if lon >= 0 else 'W'}{abs(lon):03d}")
+    return tiles
+
+
+def get_worldcover(coords, year = 2021, save_data = True, redownload = False):
+    """Function that returns the ESA WorldCover land cover map at its native 10 m resolution
+    inputs:
+        - coords: Coordinate box [min_lon, min_lat, max_lon, max_lat] in WGS84
+        - year: 2020 (algorithm v100) or 2021 (algorithm v200)
+        - save_data: boolean determining whether to save the map on disk
+        - redownload: boolean determining whether to download data again (gets data saved on disk if not)
+    outputs:
+        - ds: xarray Dataset with dimensions (lat, lon) and one hot encoded variables for land cover types
+    """
+
+    # public Cloud-Optimised GeoTIFFs from ESA, only the window over coords is read
+    version = {2020: "v100", 2021: "v200"}[year]
+    urls = [f"https://esa-worldcover.s3.eu-central-1.amazonaws.com/{version}/{year}/map/"
+            f"ESA_WorldCover_10m_{year}_{version}_{tile}_Map.tif" for tile in _worldcover_tiles(coords)]
+    raw_path = Path("data/raw/worldcover") / _area_name(coords) / f"worldcover_{year}.tif"
+
+    landcover = _get_cog_mosaic(urls, coords, raw_path, save_data, redownload)
+    ds = landcover.astype(np.uint8).to_dataset(name = "landcover")
+    ds['landcover'].attrs = {'flag_values': list(WORLDCOVER_CLASSES),
+                             'flag_meanings': " ".join(WORLDCOVER_CLASSES.values())}
+    return ds
+
+
+
+def fill_sea(ds):
+    """Function that fills NaN cells (e.g. sea cells in ERA5-Land, which only covers land)
+    with the values of their neighbouring cells, first along longitude then along latitude
+    inputs:
+        - ds: xarray Dataset with dimensions (..., lat, lon)
+    outputs:
+        - ds: same Dataset without NaN cells (as long as each row or column has at least one valid cell)
+    """
+    return ds.ffill("lon").bfill("lon").ffill("lat").bfill("lat")
+
+
+def regrid(ds, target, method):
+    """Function that resamples a dataset onto the lat/lon grid of a target dataset
+    inputs:
+        - ds: xarray Dataset with dimensions (..., lat, lon) in WGS84, e.g. ERA5, DEM or WorldCover
+        - target: xarray Dataset defining the output grid through its lat and lon coordinates (pixel centres),
+        e.g. the NDMI dataset
+        - method: rasterio resampling method
+            - "bilinear" for continuous variables (weather, elevation)
+            - "mode" for categories (land cover): most common class under each target pixel
+            - "average" for continuous variables going from fine to coarse
+    outputs:
+        - ds: xarray Dataset with the same variables on the target lat and lon
+    """
+
+    # target grid: pixel edges from pixel centres (lat goes from north to south)
+    lat, lon = target.lat.values, target.lon.values
+    dlat, dlon = abs(lat[1] - lat[0]), abs(lon[1] - lon[0])
+    transform = from_bounds(lon.min() - dlon / 2, lat.min() - dlat / 2,
+                            lon.max() + dlon / 2, lat.max() + dlat / 2, len(lon), len(lat))
+
+    out = (ds.rio.set_spatial_dims(x_dim = "lon", y_dim = "lat")
+             .rio.write_crs("EPSG:4326")
+             .rio.reproject("EPSG:4326", shape = (len(lat), len(lon)), transform = transform,
+                            resampling = Resampling[method]))
+
+    # use the exact target coordinates so that xr.merge aligns without rounding differences
+    out = out.rename({"y": "lat", "x": "lon"}) if "x" in out.dims else out
+    out = out.assign_coords(lat = lat, lon = lon).drop_vars("spatial_ref")
+
+    # drop the nodata attribute added by rioxarray, it blocks saving the cube to netcdf/zarr
+    for v in out.data_vars:
+        out[v].attrs.pop("_FillValue", None)
+    return out
+
+
+
+def terrain_features(elevation, flat_slope = 1):
+    """Function that computes terrain variables from an elevation map in WGS84
+    (compute them after regridding, never interpolate aspect: averaging 359 and 1 degrees gives 180)
+    inputs:
+        - elevation: xarray DataArray with dimensions (lat, lon) in metres, lat from north to south
+        - flat_slope: slope in degrees below which ground is considered flat (aspect set to NaN)
+    outputs:
+        - ds: xarray Dataset with dimensions (lat, lon) and variables
+            - slope in degrees
+            - aspect: direction the slope faces, in degrees clockwise from north (NaN on flat ground)
+            - northness: cos(aspect) * sin(slope), +1 steep north-facing, -1 steep south-facing, ~0 flat
+            - eastness: sin(aspect) * sin(slope), +1 steep east-facing, -1 steep west-facing, ~0 flat
+    """
+    lats = elevation.lat.values
+    lons = elevation.lon.values
+
+    # pixel size in metres (1 degree of latitude ~ 111.32 km, longitude shrinks with cos(lat))
+    dy = abs(lats[1] - lats[0]) * 111_320
+    dx = abs(lons[1] - lons[0]) * 111_320 * np.cos(np.deg2rad(lats))[:, np.newaxis]
+
+    # elevation change per metre towards north and east (rows go from north to south)
+    dz_row, dz_col = np.gradient(elevation.values)
+    dz_north = -dz_row / dy
+    dz_east = dz_col / dx
+
+    # slope and aspect (downhill direction, clockwise from north) in radians
+    slope = np.arctan(np.hypot(dz_east, dz_north))
+    aspect = np.arctan2(-dz_east, -dz_north)
+
+    # aspect weighted by slope, model inputs: fade smoothly to 0 on flat ground, no threshold needed
+    northness = np.cos(aspect) * np.sin(slope)
+    eastness = np.sin(aspect) * np.sin(slope)
+
+    # degrees for the output, aspect NaN on flat ground where it has no meaning
+    slope_deg = np.degrees(slope)
+    aspect_deg = np.where(slope_deg < flat_slope, np.nan, (np.degrees(aspect) + 360) % 360)
+
+    return xr.Dataset(
+        {
+            'slope': (('lat', 'lon'), slope_deg.astype(np.float32)),
+            'aspect': (('lat', 'lon'), aspect_deg.astype(np.float32)),
+            'northness': (('lat', 'lon'), northness.astype(np.float32)),
+            'eastness': (('lat', 'lon'), eastness.astype(np.float32)),
+        },
+        coords = {'lat': lats, 'lon': lons},
+    )
+
+
+def one_hot_landcover(landcover):
+    """Function that one-hot encodes a WorldCover class map
+    (compute it after regridding with method "mode", never interpolate the one-hot variables)
+    inputs:
+        - landcover: xarray DataArray with dimensions (lat, lon) and WORLDCOVER_CLASSES codes
+    outputs:
+        - ds: xarray Dataset with one 0/1 variable per class (lc_tree_cover, lc_cropland, ...)
+    """
+    return xr.Dataset({f'lc_{name}': (landcover == code).astype(np.uint8)
+                       for code, name in WORLDCOVER_CLASSES.items()})
+
+
+
+def era5_to_grid(era5, target):
+    """Function that brings ERA5-Land data onto the target grid
+    (sea cells filled from neighbouring land cells first, then bilinear interpolation)
+    inputs:
+        - era5: xarray Dataset from get_era5, dimensions (time, lat, lon) at ~9 km
+        - target: xarray Dataset defining the output grid, e.g. the NDMI dataset
+    outputs:
+        - ds: xarray Dataset with the same variables on the target lat and lon
+    """
+    return regrid(fill_sea(era5), target, "bilinear")
+
+
+def dem_to_grid(dem, target, flat_slope = 1):
+    """Function that brings the DEM onto the target grid and adds the terrain variables
+    (elevation interpolated bilinearly first, terrain variables computed after on the target grid)
+    inputs:
+        - dem: xarray Dataset from get_dem, dimensions (lat, lon) at ~30 m
+        - target: xarray Dataset defining the output grid, e.g. the NDMI dataset
+        - flat_slope: slope in degrees below which ground is considered flat (aspect set to NaN)
+    outputs:
+        - ds: xarray Dataset on the target lat and lon with elevation, slope, aspect, northness and eastness
+    """
+    dem_grid = regrid(dem, target, "bilinear")
+    return xr.merge([dem_grid, terrain_features(dem_grid.elevation, flat_slope)])
+
+
+def worldcover_to_grid(wc, target):
+    """Function that brings the WorldCover map onto the target grid and adds the one-hot encoding
+    (most common class under each target pixel first, one-hot encoding computed after)
+    inputs:
+        - wc: xarray Dataset from get_worldcover, dimensions (lat, lon) at 10 m
+        - target: xarray Dataset defining the output grid, e.g. the NDMI dataset
+    outputs:
+        - ds: xarray Dataset on the target lat and lon with the landcover class codes
+        and one 0/1 variable per class (lc_tree_cover, lc_cropland, ...)
+    """
+    wc_grid = regrid(wc, target, "mode")
+    return xr.merge([wc_grid, one_hot_landcover(wc_grid.landcover)])
