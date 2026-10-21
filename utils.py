@@ -450,7 +450,7 @@ def fill_sea(ds):
 def regrid(ds, target, method):
     """Function that resamples a dataset onto the lat/lon grid of a target dataset
     inputs:
-        - ds: xarray Dataset with dimensions (..., lat, lon) in WGS84, e.g. ERA5, DEM or WorldCover
+        - ds: xarray Dataset or DataArray with dimensions (..., lat, lon) in WGS84, e.g. ERA5, DEM or WorldCover
         - target: xarray Dataset defining the output grid through its lat and lon coordinates (pixel centres),
         e.g. the NDMI dataset
         - method: rasterio resampling method
@@ -458,7 +458,7 @@ def regrid(ds, target, method):
             - "mode" for categories (land cover): most common class under each target pixel
             - "average" for continuous variables going from fine to coarse
     outputs:
-        - ds: xarray Dataset with the same variables on the target lat and lon
+        - ds: same type as the input (Dataset or DataArray) on the target lat and lon
     """
 
     # target grid: pixel edges from pixel centres (lat goes from north to south)
@@ -477,8 +477,8 @@ def regrid(ds, target, method):
     out = out.assign_coords(lat = lat, lon = lon).drop_vars("spatial_ref")
 
     # drop the nodata attribute added by rioxarray, it blocks saving the cube to netcdf/zarr
-    for v in out.data_vars:
-        out[v].attrs.pop("_FillValue", None)
+    for v in (out.data_vars.values() if isinstance(out, xr.Dataset) else [out]):
+        v.attrs.pop("_FillValue", None)
     return out
 
 
