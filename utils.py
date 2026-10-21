@@ -188,12 +188,22 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
 
 
 
+ERA5_SHORT_NAMES = {
+    "total_precipitation": "tp",
+    "2m_temperature": "t2m",
+    "potential_evaporation": "pev",
+    "total_evaporation": "e",
+    "volumetric_soil_water_layer_1": "swvl1",
+    "volumetric_soil_water_layer_2": "swvl2",
+}
+
+
 def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload = False):
     """Function that returns ERA5-Land monthly means of requested variables
     inputs:
         - coords: Coordinate box delimiting the square over which to download the data [min_lon, min_lat, max_lon, max_lat] in WGS84
         - dates: list of [[year, month]] dates for which to request data
-        - variables: list of ERA5-Land variable names to download
+        - variables: list of ERA5-Land variable names to download (keys of ERA5_SHORT_NAMES)
         - margin: degrees added around the box, since the ERA5-Land grid is ~9 km
         - save_data: boolean determining whether to keep the downloaded file on disk
         - redownload: boolean determining whether to download data again (gets data saved on disk if not)
@@ -201,13 +211,26 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
         - ds: xarray Dataset with dimensions (time, lat, lon) and the requested monthly variables
     """
 
+    unknown = [v for v in variables if v not in ERA5_SHORT_NAMES]
+    if unknown:
+        raise ValueError(f"unknown ERA5-Land variables {unknown}, add their short names to ERA5_SHORT_NAMES")
+    short_names = [ERA5_SHORT_NAMES[v] for v in variables]
+
     months = _month_list(dates)
     month_paths = {start: Path(make_data_folder(coords, (start, end), root="data/raw/era5")) / "era5_land_monthly.nc"
                    for start, end in months}
-    missing = [(start, end) for start, end in months if redownload or not month_paths[start].exists()]
+
+    # read saved months; a month is complete only if its file has all the requested variables
+    parts, saved = {}, {}
+    for start, _ in months:
+        if month_paths[start].exists():
+            with xr.open_dataset(month_paths[start], engine="scipy") as month_ds:
+                saved[start] = month_ds.load()
+            if not redownload and all(v in saved[start] for v in short_names):
+                parts[start] = saved[start][short_names]
+    missing = [(start, end) for start, end in months if start not in parts]
 
     # download all missing months in a single CDS request, then split them into one file per month
-    parts = {}
     if missing:
         # CDS area is [N, W, S, E]
         min_lon, min_lat, max_lon, max_lat = coords
@@ -233,23 +256,22 @@ def get_era5(coords, dates, variables, margin=0.1, save_data = True, redownload 
 
         not_available = []
         for start, end in missing:
-            month_ds = ds_new.sel(time=slice(start, end))
+            month_ds = ds_new.sel(time=slice(start, end))[short_names]
             if month_ds.time.size == 0:
                 not_available.append(f"{start:%Y-%m}")
                 continue
-            # saved as NETCDF3: much faster to open than NETCDF4/HDF5 for many small files
+            # saved as NETCDF3: much faster to open than NETCDF4/HDF5 for many small files,
+            # keeping the other variables already saved for that month
             if save_data:
+                to_save = month_ds
+                if start in saved:
+                    other = saved[start].drop_vars(short_names, errors="ignore")
+                    to_save = xr.merge([other, month_ds], join="override", compat="override")
                 month_paths[start].parent.mkdir(parents=True, exist_ok=True)
-                month_ds.to_netcdf(month_paths[start], format="NETCDF3_64BIT", engine="scipy")
+                to_save.to_netcdf(month_paths[start], format="NETCDF3_64BIT", engine="scipy")
             parts[start] = month_ds
         if not_available:
             raise ValueError(f"CDS returned no data for months: {not_available}")
-
-    # read already saved months from disk
-    for start, _ in months:
-        if start not in parts:
-            with xr.open_dataset(month_paths[start], engine="scipy") as month_ds:
-                parts[start] = month_ds.load()
 
     ds = xr.concat([parts[start] for start, _ in months], dim="time")
     ds = ds.rename({"latitude": "lat", "longitude": "lon"})
