@@ -17,7 +17,6 @@ from sentinelhub import (
     BBox,
     bbox_to_dimensions,
     CRS,
-    SentinelHubCatalog,
     SentinelHubRequest,
     DataCollection,
     MimeType,
@@ -82,10 +81,10 @@ def _month_list(dates):
     return sorted({_month_interval(d) for d in dates})
 
 
-def _ndmi_dataset(img, start, coords):
+def _index_dataset(img, start, coords, index):
     """
-    function that converts one monthly NDMI image (height, width, 2) into a dataset
-    with dimensions (time, lat, lon) and variables NDMI median and clear observation count
+    function that converts one monthly index image (height, width, 2) into a dataset
+    with dimensions (time, lat, lon) and variables index median (e.g. ndmi_median) and clear observation count
     """
     height, width = img.shape[:2]
 
@@ -98,7 +97,7 @@ def _ndmi_dataset(img, start, coords):
     img = img.astype(np.float32)[np.newaxis]
     return xr.Dataset(
         {
-            'ndmi_median': (('time', 'lat', 'lon'), img[..., 0]),
+            f'{index}_median': (('time', 'lat', 'lon'), img[..., 0]),
             'clear_count': (('time', 'lat', 'lon'), img[..., 1]),
         },
         coords = {'time': [start], 'lat': lats, 'lon': lons},
@@ -106,35 +105,45 @@ def _ndmi_dataset(img, start, coords):
 
 
 
-def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = False):
-    """Function that returns the monthly median NDMI index, after filtering out
-      clouds, shadows, water and snow
+# normalised difference indices
+INDEX_FORMULAS = {
+    "ndmi": (["B8A", "B11"], "(s.B8A - s.B11) / (s.B8A + s.B11)"),   # vegetation water content
+    "ndvi": (["B04", "B08"], "(s.B08 - s.B04) / (s.B08 + s.B04)"),   # vegetation greenness
+}
+
+
+def get_index(coords, resolution, dates, config, index = "ndmi", save_data = True, redownload = False):
+    """Function that returns the monthly median of a Sentinel-2 vegetation index (NDMI, NDVI, ...),
+    after filtering out clouds, shadows, water and snow
     inputs:
-        - coords: Coordinate box delimiting the square over which to compute the NDMI index
+        - coords: Coordinate box delimiting the square over which to compute the index
         - resolution: Resolution of the requested data
         - dates: list of [[year, month]] dates for which to request data, one request per month
         - config: SentinelHub configuration
+        - index: name of the index to be requested, from the keys of INDEX_FORMULAS
         - save_data: boolean determining whether to save requested data on disk
         - redownload: boolean determining whether to download data again (gets data saved on disk if not)
     outputs:
-        - ds: xarray Dataset with dimensions (time, lat, lon) on pixel centers, with monthly NDMI median
-        values and the total number of clear (non-masked) observations used to compute each of them
+        - ds: xarray Dataset with dimensions (time, lat, lon) on pixel centers, with the monthly index median
+        (e.g. ndmi_median) and the total number of clear (non-masked) observations used to compute each of them
     """
 
+    if index not in INDEX_FORMULAS:
+        raise ValueError(f"unknown index '{index}', available: {list(INDEX_FORMULAS)}")
+    bands, formula = INDEX_FORMULAS[index]
 
     months = _month_list(dates)
 
     # SentinelHub specifications
     m_bbox = BBox(bbox = coords, crs=CRS.WGS84)
     m_size = bbox_to_dimensions(m_bbox, resolution = resolution)
-    catalog = SentinelHubCatalog(config = config)
 
-    # select NIR (B8A) and SWIR (B11) channels from sentinel data
-    evalscript_ndmi = """
+    # select the index bands from sentinel data
+    evalscript = """
         //VERSION=3
         function setup() {
             return {
-                input: [{bands: ["B8A","B11", "SCL", "dataMask"],units: "DN"}],
+                input: [{bands: [__BANDS__, "SCL", "dataMask"],units: "DN"}],
                 output: {bands: 2, sampleType: "FLOAT32"},
                 mosaicking: "ORBIT"
             };
@@ -147,19 +156,19 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
 
         // return median
         function evaluatePixel(sample) {
-          const v = sample.filter(isClear).map(s => (s.B8A - s.B11) / (s.B8A + s.B11));
+          const v = sample.filter(isClear).map(s => __FORMULA__);
           if (v.length == 0) return [NaN, 0];
           v.sort((a, b) => a - b);
           const m = Math.floor(v.length / 2);
           const median = v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
           return [median, v.length];
         }
-    """
+    """.replace("__BANDS__", ",".join(f'"{b}"' for b in bands)).replace("__FORMULA__", formula)
 
     # define requesting function, one request per month
-    def request_ndmi(start, end):
+    def request_index(start, end):
         return SentinelHubRequest(
-            evalscript = evalscript_ndmi,
+            evalscript = evalscript,
             input_data=[
                 SentinelHubRequest.input_data(
                     data_collection=DataCollection.SENTINEL2_L2A.define_from(
@@ -172,15 +181,15 @@ def get_ndmi(coords, resolution, dates, config, save_data = True, redownload = F
             bbox = m_bbox,
             size = m_size,
             config = config,
-            data_folder = make_data_folder(coords, (start, end))
+            data_folder = make_data_folder(coords, (start, end), root = f"data/raw/s2/{index}")
         )
 
     # request data from SentinelHub month by month
     # (already saved months are read from disk unless redownload is True)
     parts = []
     for start, end in months:
-        data = request_ndmi(start, end).get_data(save_data = save_data, redownload = redownload)
-        parts.append(_ndmi_dataset(data[0], start, coords))
+        data = request_index(start, end).get_data(save_data = save_data, redownload = redownload)
+        parts.append(_index_dataset(data[0], start, coords, index))
 
     return xr.concat(parts, dim = 'time')
 
