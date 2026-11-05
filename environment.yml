@@ -1,0 +1,28 @@
+name: drought
+channels:
+  - conda-forge
+  - nodefaults            # never mix in Anaconda's "defaults" (MKL) packages
+dependencies:
+  - python=3.12
+  - numpy
+  - libblas=*=*openblas    # not MKL: MKL's OpenMP clashes with torch's
+  - pandas
+  - scipy
+  - xarray
+  - bottleneck            # needed by xarray ffill/bfill (fill_sea in src/grid.py)
+  - dask
+  - zarr>=3
+  - netcdf4
+  - rioxarray
+  - rasterio
+  - matplotlib
+  - sentinelhub
+  - cdsapi
+  - pyarrow               # Parquet tables in A1
+  - pytest
+  - ipykernel             # lets VS Code use this env as a notebook kernel
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.14.1+cu130
+      - torchvision==0.29.1+cu130
