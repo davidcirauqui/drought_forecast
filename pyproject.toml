@@ -11,5 +11,10 @@ dependencies = [
     "rioxarray", "rasterio", "matplotlib", "sentinelhub", "cdsapi",
 ]
 
+[project.optional-dependencies]
+# CUDA build: pip install -e ".[dl]" --extra-index-url https://download.pytorch.org/whl/cu130
+dl = ["torch==2.14.1", "torchvision==0.29.1"]
+
+
 [tool.setuptools]
 packages = ["src"]
