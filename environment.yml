@@ -19,6 +19,7 @@ dependencies:
   - sentinelhub
   - cdsapi
   - pyarrow               # Parquet tables in A1
+  - scikit-learn          
   - pytest
   - ipykernel             # lets VS Code use this env as a notebook kernel
   - pip
