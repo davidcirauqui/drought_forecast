@@ -2,7 +2,7 @@ import pandas as pd
 
 
 SPLITS = {"train": (2017, 2021),
-          "val"  : (2021, 2022),
+          "val"  : (2022, 2022),
           "test" : (2023, 2025)}
 
 
