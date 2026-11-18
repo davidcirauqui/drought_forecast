@@ -46,6 +46,7 @@ def make_samples(times, T = 12, horizon = 3, splits = SPLITS):
       leakage: a real forecast issued at t0 has that past data.
     """
 
+    times = pd.DatetimeIndex(times)
 
     samples = []
     for i in range(T - 1, len(times) - horizon):
