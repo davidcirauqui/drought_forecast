@@ -62,6 +62,37 @@ def make_samples(times, T = 12, horizon = 3, splits = SPLITS):
 
     return pd.DataFrame(samples, columns = ["t0_idx", "t0", "split"])
 
+
+def land_mask(cube):
+    """ Creates a mask that defines which pixels can be used (for training, statistics, tiles, etc)
+    
+    Parameters
+    ----------
+    cube : xr.Dataset 
+        cube containing landcover and valid_mask
+
+    Returns
+    -------
+    xr.DataArray
+        Boolean for each (lat, lon) pair, True if the pixel is used  
+
+    Notes
+    -----
+    Pixels are masked out if one of the following conditions apply:
+        - they represent bodies of water
+        - they represent built up structures (roads, buildings...) 
+        - they have never been observed
+    Water and built up areas are masked out because NDMI there does not reflect any climate-driven variable
+    """
+
+    not_water = cube.landcover != 80
+    not_built = cube.landcover != 50 
+    observed = cube.valid_mask.any("time")
+
+    return not_water & not_built & observed
+
+
+
         
 
         
