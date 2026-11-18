@@ -9,27 +9,6 @@ TIMES = pd.date_range("2017-04", "2025-12", freq = "MS")
 T = 12
 H = 3
 
-def test_split_counts():
-    samples = make_samples(TIMES, T = T, horizon = H)
-    counts = samples["split"].value_counts().to_dict()
-    assert counts == {"train" : 43, "val" : 10, "test": 34}
-
-
-
-def assert_samples_in_splits(samples, splits = SPLITS):
-    for sample in samples.itertuples():
-        (yyyy_0, yyyy_f) = splits[sample.split]
-        for h in range(1, 1 + H):
-            year = TIMES[int(sample.t0_idx) + h].year
-            assert yyyy_0 <= year <= yyyy_f, f"t0 = {sample.t0:%Y-%m}, h={h}: target year {year} is outside {sample.split} split {yyyy_0}-{yyyy_f}"
-
-
-def test_targets_inside_split():
-    """check no sample leaks info between splits"""
-
-    samples = make_samples(TIMES, T = T, horizon = H)
-    assert_samples_in_splits(samples)
-
 
 def test_splits_do_not_overlap():
     ranges = {}
@@ -51,7 +30,28 @@ def test_splits_cover_all_years():
 
 
 
-def test_custom_splits_are_used():
+def test_make_samples_split_counts():
+    samples = make_samples(TIMES, T = T, horizon = H)
+    counts = samples["split"].value_counts().to_dict()
+    assert counts == {"train" : 43, "val" : 10, "test": 34}
+
+
+def assert_samples_in_splits(samples, splits = SPLITS):
+    for sample in samples.itertuples():
+        (yyyy_0, yyyy_f) = splits[sample.split]
+        for h in range(1, 1 + H):
+            year = TIMES[int(sample.t0_idx) + h].year
+            assert yyyy_0 <= year <= yyyy_f, f"t0 = {sample.t0:%Y-%m}, h={h}: target year {year} is outside {sample.split} split {yyyy_0}-{yyyy_f}"
+
+
+def test_make_samples_targets_inside_split():
+    """check no sample leaks info between splits"""
+
+    samples = make_samples(TIMES, T = T, horizon = H)
+    assert_samples_in_splits(samples)
+
+
+def test_make_samples_uses_custom_splits():
     new_splits = {"train": (2017, 2020),
                   "val"  : (2021, 2021),
                   "test" : (2022, 2025)}
@@ -61,14 +61,14 @@ def test_custom_splits_are_used():
 
 
 
-def test_windows_exists():
+def test_make_samples_windows_inside_time_axis():
     samples = make_samples(TIMES, T = T, horizon = H, splits = SPLITS)
 
     assert (samples.t0_idx - T + 1 >= 0).all()
     assert (samples.t0_idx + H < len(TIMES)).all()
 
 
-def test_samples_outside_splits_are_dropped():
+def test_make_samples_drops_years_outside_splits():
     times_long = pd.date_range("2017-04", "2026-12", freq = "MS")
     samples = make_samples(times_long, T = T, horizon = H, splits = SPLITS)
     counts = samples["split"].value_counts().to_dict()
