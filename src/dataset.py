@@ -1,4 +1,6 @@
 import pandas as pd
+import numpy as np
+import xarray as xr
 
 
 SPLITS = {"train": (2017, 2021),
@@ -65,7 +67,8 @@ def make_samples(times, T = 12, horizon = 3, splits = SPLITS):
 
 
 def land_mask(cube):
-    """ Creates a mask that defines which pixels can be used (for training, statistics, tiles, etc)
+    """ Creates a mask that defines which pixels can be used (for training, statistics, tiles, etc),
+    based on wether they are valid climate-related signals or not
     
     Parameters
     ----------
@@ -96,7 +99,46 @@ def land_mask(cube):
 
         
 
-        
+def holdout_mask(cube, frac = .2, tile = 64):
+    """ Creates a mask that defines which pixels are held out. Held out pixels are never used 
+    for either training, validation or normalisation, so that they are kept apart to test 
+    the model on completely new places.
+    
+    Parameters
+    ----------
+    cube : xr.Dataset 
+        cube containing (lat, lon) coordinates, with lon increasing west to east
+    frac : float
+        defines the minimum fraction of columns that are masked out
+    tile : int
+        Tile size in pixels.
+
+    Returns
+    -------
+    xr.DataArray
+        Boolean for each (lat, lon) pair, True if the pixel is held out  
+
+    Notes
+    -----
+    - Pixels are held out if they belong to the easternmost strip of the map.
+    - For some models (like ConvLSTM), the area is cut into square tiles of 
+    64x64 pixels, each tile-month being one training example. The held-out 
+    boundary is accordingly rounded down to the edges of such tiles. 
+    """
+
+    lon = cube.lon
+    if not (np.diff(lon.values) > 0).all():
+        raise ValueError("lon must increase west to east")
+
+    n_lon = cube.sizes['lon']
+    cut = (int(n_lon * (1 - frac)) // tile) * tile 
+
+    mask = np.arange(n_lon) >= cut
+    mask = xr.DataArray(mask, dims = 'lon', coords = {'lon': lon})
+    mask = mask.broadcast_like(cube.lat).transpose('lat', 'lon')
+
+    return mask
+
 
 
 

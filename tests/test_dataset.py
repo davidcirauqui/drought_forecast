@@ -1,8 +1,9 @@
 import pandas as pd
 import xarray as xr
 import numpy as np
-from src.dataset import make_samples, SPLITS, split_of_year, land_mask
+from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask
 import itertools
+import pytest
 
 
 TIMES = pd.date_range("2017-04", "2025-12", freq = "MS")
@@ -111,4 +112,62 @@ def test_land_mask_is_2d_lat_lon():
 def test_land_mask_is_boolean():
     mask = land_mask(make_toy_cube())
     assert mask.dtype == bool
+
+
+
+def make_toy_grid(n_lat, n_lon):
+    lats = np.linspace(42.1, 41.9, n_lat)
+    lons = np.linspace(3.0, 3.2, n_lon)
+    return xr.Dataset(coords = {"lat": lats, "lon": lons})
+
+
+def test_holdout_mask_selects_eastern_columns():
+    n_lat = 3
+    n_lon = 10
+    grid = make_toy_grid(n_lat = n_lat, n_lon = n_lon)
+    mask = holdout_mask(grid, frac = 0.2, tile = 2)
+
+    expected = np.zeros([n_lat, n_lon], dtype = bool)
+    expected[:, 8:] = True
+
+    assert np.array_equal(mask.values, expected), f"\nmask: \n{mask.values}   \nexpected_mask: \n{expected}"
+
+
+def test_holdout_mask_boundary_snaps_west_to_tile_edge():
+    n_lat = 3
+    n_lon = 9
+    tile = 2
+    grid = make_toy_grid(n_lat = n_lat, n_lon = n_lon)
+    mask = holdout_mask(grid, frac = 0.2, tile = tile)
+    first_true = np.argmax(mask[0].values)
+    
+    expected = np.zeros([n_lat, n_lon], dtype = bool)
+    expected[:, 6:] = True
+    assert np.array_equal(mask.values, expected), f"\nmask: \n{mask.values}   \nexpected_mask: \n{expected}"
+    
+    leftover = first_true % tile
+    assert leftover == 0, f"first held_out column is {first_true}, must be multiple of tile size {tile}"
+
+
+def test_holdout_mask_raises_on_decreasing_lon():
+    n_lat = 3
+    n_lon = 9
+    grid = make_toy_grid(n_lat = n_lat, n_lon = n_lon)
+    reversed_grid = grid.isel(lon = slice(None, None, -1)) 
+
+    with pytest.raises(ValueError, match = "increase"):
+        holdout_mask(reversed_grid, frac = .2, tile = 2)
+
+
+
+def test_holdout_mask_is_2d_bool():
+    grid = make_toy_grid(3, 10)
+    mask = holdout_mask(grid, frac = .2, tile = 2)
+
+    assert mask.dims == ("lat", "lon"), f"mask.dims are {mask.dims}, should be ('lat', 'lon')"
+    assert mask.dtype == bool, f"mask.dtype is {mask.dtype}, should be bool"
+
+
+
+
 
