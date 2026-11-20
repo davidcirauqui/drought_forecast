@@ -7,6 +7,9 @@ SPLITS = {"train": (2017, 2021),
           "val"  : (2022, 2022),
           "test" : (2023, 2025)}
 
+SCALED_VARS = ['ndmi_anomaly_filled', 'tp', 't2m', 'pev', 'e', 'swvl1', 
+               'swvl2', 'spi3', 'spi6', 'spi12', 'elevation', 'slope']
+
 
 def split_of_year(year, splits = SPLITS):
     for split, (yyyy_0, yyyy_f) in splits.items():
@@ -139,6 +142,70 @@ def holdout_mask(cube, frac = .2, tile = 64):
 
     return mask
 
+
+
+
+
+def normalisation_stats(cube, train_mask, variables = SCALED_VARS, years = SPLITS["train"]):
+
+    """ Returns mean and std for all requested variables, computed over training
+    splits and pixels only. Since test years span over the drought period, including 
+    them would shift the mean towards dry values.
+
+    Parameters
+    ----------
+    cube : xr.Dataset
+        cube containing variables for which to compute the statistics
+    train_mask: xr.DataArray (bool, lat x lon)
+        lat-lon mask determining which pixels are used for training (True if are used)
+    variables: [str]
+        list of variables for which statistics are computed
+    years: (int, int)
+        Start and end year of the training period. Default SPLITS["train"], both years inclusive
+
+    Returns
+    -------
+    stats : dict
+        Dictionary with one entry per variable. Each entry is a dictionary with 'mean' 
+        and 'std' values: {"tp": {"mean": float, "std": float}, ...}
+
+
+    Notes
+    -----
+    - NaN values are skipped
+    - variables without a time dim are selected only by pixel 
+    - raises ValueError if any statistic is not finite or std is 0
+    
+    """
+    
+    y0, yf = years
+    stats = {}
+    for variable in variables:
+
+        # select data
+        data = cube[variable]
+        
+        # if variable has time dimension, apply time mask
+        if 'time' in data.dims:
+            data = data.sel(time = slice(str(y0), str(yf)))
+
+        # apply training-pixel mask
+        data = data.where(train_mask)
+
+        # compute mean and std over all dimensions
+        mean = float(data.mean())
+        std = float(data.std())
+
+        if not (np.isfinite(mean) and np.isfinite(std) and std > 0):
+            raise ValueError(
+                f"{variable}: invalid statistics (mean={mean}, std={std}) "
+                f"over training years {y0}-{yf} and training pixels"
+            )
+
+        # store in dict
+        stats[variable] = {"mean" : mean, "std" : std}
+
+    return stats
 
 
 

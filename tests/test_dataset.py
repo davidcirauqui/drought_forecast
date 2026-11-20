@@ -1,9 +1,10 @@
 import pandas as pd
 import xarray as xr
 import numpy as np
-from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask
+from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask, normalisation_stats
 import itertools
 import pytest
+import json
 
 
 TIMES = pd.date_range("2017-04", "2025-12", freq = "MS")
@@ -170,4 +171,102 @@ def test_holdout_mask_is_2d_bool():
 
 
 
+
+
+
+def make_toy_stats_cube():
+    time = pd.to_datetime(["2020-01-01", "2020-02-01", "2024-01-01", "2024-02-01"])
+    lat = np.linspace(0, 1, 2)
+    lon = np.linspace(0, 1, 4)
+
+    n_lat = len(lat)
+    n_lon = len(lon)
+    n_time = len(time)
+
+    time_dependent = np.zeros([n_time, n_lat, n_lon])
+    time_dependent[0:2, 0, :-1] = 2   # training months and pixels: half twos and half zeros
+    time_dependent[2:, :, :] = 100    # test months: 100 everywhere
+    time_dependent[:, :, -1] = 1000   # holdout (east strip): 1000 everywhere
+
+    with_nans = time_dependent.copy()
+    with_nans[1, :, :] = np.nan   # month with no data
+
+    time_independent = np.zeros([n_lat, n_lon])
+    time_independent[0, :-1] = 2     # training pixels: half twos and half zeros
+    time_independent[:, -1] = 1000   # holdout (east strip): 1000 everywhere
+
+    constant = np.ones([n_lat, n_lon])
+
+    ds = xr.Dataset(
+        data_vars = {
+            'time_dependent' : (["time", "lat", "lon"], time_dependent),
+            'with_nans' : (["time", "lat", "lon"], with_nans),
+            'time_independent' : (["lat", "lon"], time_independent),
+            'constant' : (["lat", "lon"], constant)
+        },
+        coords = {
+            'lat' : lat,
+            'lon' : lon,
+            'time': time
+        }
+    )
+
+
+    train_mask = np.ones([n_lat, n_lon], dtype = bool)
+    train_mask[:, -1] = False
+    train_mask = xr.DataArray(train_mask, dims = ['lat', 'lon'])
+
+    return ds, train_mask
+
+
+
+
+def test_normalisation_stats_excludes_test_years_and_holdout():
+    cube, train_mask = make_toy_stats_cube()
+    stats = normalisation_stats(cube, train_mask, variables = ['time_dependent'], years = (2020, 2020))
+
+    mean = stats['time_dependent']['mean']
+    assert mean == pytest.approx(1), f"mean of time dependent variable should be 1, is {mean}"
+
+    std = stats['time_dependent']['std']
+    assert std == pytest.approx(1), f"std of time dependent variable should be 1, is {std}"
+
+
+def test_normalisation_stats_static_variable_excludes_holdout():
+    cube, train_mask = make_toy_stats_cube()
+    stats = normalisation_stats(cube, train_mask, variables = ['time_independent'], years = (2020, 2020))
+
+    mean = stats['time_independent']['mean']
+    assert mean == pytest.approx(1), f"mean of time independent variable should be 1, is {mean}"
+
+    std = stats['time_independent']['std']
+    assert std == pytest.approx(1), f"std of time independent variable should be 1, is {std}"
+
+
+
+def test_normalisation_stats_ignores_nan():
+    cube, train_mask = make_toy_stats_cube()
+    stats = normalisation_stats(cube, train_mask, variables = ['with_nans'], years = (2020, 2020))
+
+    mean = stats['with_nans']['mean']
+    assert mean == pytest.approx(1), f"mean of variable with nans should be 1, is {mean}"
+
+    std = stats['with_nans']['std']
+    assert std == pytest.approx(1), f"std of variable with nans should be 1, is {std}"
+
+
+
+def test_normalisation_stats_raises_null_std():
+    cube, train_mask = make_toy_stats_cube()
+    with pytest.raises(ValueError, match = 'std=0'):
+        normalisation_stats(cube, train_mask, variables = ['constant'], years = (2020, 2020))
+
+
+
+def test_normalisation_stats_output_is_json_serialisable():
+    cube, train_mask = make_toy_stats_cube()
+    stats = normalisation_stats(cube, train_mask, variables = ['time_dependent', 'time_independent'],
+                                 years = (2020, 2020))
+
+    assert json.loads(json.dumps(stats)) == stats
 
