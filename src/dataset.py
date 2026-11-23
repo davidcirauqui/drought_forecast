@@ -209,3 +209,75 @@ def normalisation_stats(cube, train_mask, variables = SCALED_VARS, years = SPLIT
 
 
 
+def sample_pixels(cube, land, holdout, frac = .01, min_per_class = 500, seed = 0):
+    """Picks the pixels that are fed to the LightGBM table, to avoid using a table 
+    with every pixel for every sample month t0, which would be too large. Stratifying
+    by class keeps those rare ones (grasslands, wetland) from being swamped by those
+    more common (cropland, forest).
+
+    Parameters
+    ----------
+    cube : xr.Dataset
+        Cube with `landcover` (WorldCover codes) and (lat, lon) coordinates.
+    land : xr.DataArray (bool, lat x lon)
+        Usable pixels, from `land_mask`.
+    holdout : xr.DataArray (bool, lat x lon)
+        Held-out pixels, from `holdout_mask`.
+    frac : float
+        Fraction of each class's pixels to draw.
+    min_per_class : int
+        Minimum pixels per class, capped at the number available.
+    seed : int
+        Seed of the random generator, for reproducibility.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per sampled pixel, with columns:
+        - y_idx, x_idx : int, positions along lat and lon
+        - lat, lon     : float, coordinates
+        - lc_class     : int, WorldCover code
+        - holdout      : bool, True if the pixel is in the held-out strip
+        - weight       : float, pixels of its class in its region / pixels sampled.
+                         Each sampled pixel stands for `weight` real pixels, so
+                         weighted metrics are area-representative.
+
+    Notes
+    -----
+    - Held-out pixels are sampled too (test needs them) but flagged, never dropped.
+    - The rule is applied separately inside and outside the holdout, so each
+      region gets every class at its own minimum.
+    - The same pixels are used in all time splits. This isn't leakage, since splits
+      are separated by target month and generalisation to new places is measured
+      by the holdout and by spatial block Cross Validation.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    lc = cube.landcover.transpose("lat", "lon").values
+    land_v = land.transpose("lat", "lon").values
+    hold_v = holdout.transpose("lat", "lon").values
+
+    parts = []
+    for is_holdout in (False, True):
+        region = land_v & (hold_v == is_holdout)
+
+        for cls in np.unique(lc[region]):
+            y, x = np.nonzero(region & (lc == cls))
+            n = min(len(y), max(int(round(frac * len(y))), min_per_class))
+            pick = rng.choice(len(y), size = n, replace = False)
+
+            parts.append(pd.DataFrame({"y_idx": y[pick], "x_idx": x[pick],
+                                       "lc_class": int(cls), "holdout": is_holdout,
+                                       "weight": len(y) / n}))
+
+    pixels = pd.concat(parts, ignore_index = True)
+    pixels = pixels.sort_values(["y_idx", "x_idx"]).reset_index(drop = True)
+    pixels["lat"] = cube.lat.values[pixels.y_idx]
+    pixels["lon"] = cube.lon.values[pixels.x_idx]
+
+    return pixels[["y_idx", "x_idx", "lat", "lon", "lc_class", "holdout", "weight"]]
+
+
+
+

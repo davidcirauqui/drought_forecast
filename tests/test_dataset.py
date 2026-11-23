@@ -1,7 +1,8 @@
 import pandas as pd
 import xarray as xr
 import numpy as np
-from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask, normalisation_stats
+from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask
+from src.dataset import normalisation_stats, sample_pixels
 import itertools
 import pytest
 import json
@@ -269,4 +270,62 @@ def test_normalisation_stats_output_is_json_serialisable():
                                  years = (2020, 2020))
 
     assert json.loads(json.dumps(stats)) == stats
+
+
+
+
+def make_toy_lc_cube(n_lat = 20, n_lon = 20):
+    lc = np.full((n_lat, n_lon), 40, dtype = np.uint8)     # cropland
+    lc[:, n_lon // 2:] = 10                                # tree cover on the east half
+    lc[:3, :3] = 80                                        # water patch
+    ds = xr.Dataset({"landcover": (["lat", "lon"], lc)},
+                    coords = {"lat": np.linspace(42.1, 41.9, n_lat),
+                              "lon": np.linspace(2.97, 3.19, n_lon)})
+    land = ds.landcover != 80
+    holdout = holdout_mask(ds, frac = .2, tile = 4)
+    return ds, land, holdout
+
+
+def test_sample_pixels_only_land_and_no_duplicates():
+    ds, land, holdout = make_toy_lc_cube()
+    px = sample_pixels(ds, land, holdout, frac = .5, min_per_class = 1)
+    assert land.values[px.y_idx, px.x_idx].all()
+    assert not px.duplicated(["y_idx", "x_idx"]).any()
+
+
+def test_sample_pixels_holdout_flag_matches_mask():
+    ds, land, holdout = make_toy_lc_cube()
+    px = sample_pixels(ds, land, holdout, frac = 1, min_per_class = 1)
+    assert (px.holdout.values == holdout.values[px.y_idx, px.x_idx]).all()
+    assert px.holdout.any() and (~px.holdout).any()
+
+
+def test_sample_pixels_min_per_class_capped_at_available():
+    ds, land, holdout = make_toy_lc_cube()
+    px = sample_pixels(ds, land, holdout, frac = 0, min_per_class = 5)
+    counts = px.groupby(["holdout", "lc_class"]).size()
+    for (is_hold, cls), n in counts.items():
+        available = int((land & (holdout == is_hold) & (ds.landcover == cls)).sum())
+        assert n == min(5, available)
+
+
+def test_sample_pixels_weights_sum_to_available_pixels():
+    ds, land, holdout = make_toy_lc_cube()
+    px = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3)
+    sums = px.groupby(["holdout", "lc_class"]).weight.sum()
+    for (is_hold, cls), w in sums.items():
+        available = int((land & (holdout == is_hold) & (ds.landcover == cls)).sum())
+        assert w == pytest.approx(available)
+    assert px.weight.sum() == pytest.approx(int(land.sum()))
+
+
+def test_sample_pixels_seed_reproducible():
+    ds, land, holdout = make_toy_lc_cube()
+    a = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3, seed = 0)
+    b = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3, seed = 0)
+    c = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3, seed = 1)
+    pd.testing.assert_frame_equal(a, b)
+    assert not a.equals(c)
+
+
 
