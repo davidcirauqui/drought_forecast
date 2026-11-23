@@ -309,6 +309,21 @@ def test_sample_pixels_min_per_class_capped_at_available():
         assert n == min(5, available)
 
 
+def test_sample_pixels_frac_wins_and_no_group_missing():
+    ds, land, holdout = make_toy_lc_cube()
+    px = sample_pixels(ds, land, holdout, frac = .5, min_per_class = 1)
+    counts = px.groupby(["holdout", "lc_class"]).size().to_dict()
+
+    expected = {}
+    for is_hold in (False, True):
+        region = land & (holdout == is_hold)
+        for cls in np.unique(ds.landcover.values[region.values]):
+            available = int((region & (ds.landcover == cls)).sum())
+            expected[(is_hold, int(cls))] = int(round(.5 * available))
+
+    assert counts == expected
+
+
 def test_sample_pixels_weights_sum_to_available_pixels():
     ds, land, holdout = make_toy_lc_cube()
     px = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3)
