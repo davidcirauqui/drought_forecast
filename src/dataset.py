@@ -10,6 +10,13 @@ SPLITS = {"train": (2017, 2021),
 SCALED_VARS = ['ndmi_anomaly_filled', 'tp', 't2m', 'pev', 'e', 'swvl1', 
                'swvl2', 'spi3', 'spi6', 'spi12', 'elevation', 'slope']
 
+DYNAMIC_VARS = ['ndmi_anomaly_filled', 'tp', 't2m', 'pev', 'e',
+                'swvl1', 'swvl2', 'spi3', 'spi6', 'spi12']
+
+STATIC_VARS = ['elevation', 'slope', 'northness', 'eastness', 'irrigated']
+
+LEAD_VARS = ['tp', 't2m', 'pev', 'e']
+
 
 def split_of_year(year, splits = SPLITS):
     for split, (yyyy_0, yyyy_f) in splits.items():
@@ -277,6 +284,132 @@ def sample_pixels(cube, land, holdout, frac = .01, min_per_class = 500, seed = 0
     pixels["lon"] = cube.lon.values[pixels.x_idx]
 
     return pixels[["y_idx", "x_idx", "lat", "lon", "lc_class", "holdout", "weight"]]
+
+
+
+
+
+def _at_pixels(da, pixels):
+    """Values of `da` at the sampled pixels: (time, pixel) if `da` has time, else (pixel,)"""
+    if "time" in da.dims:
+        da = da.transpose("time", "lat", "lon")
+    return da.isel(lat = xr.DataArray(pixels.y_idx.values, dims = "pixel"),
+                   lon = xr.DataArray(pixels.x_idx.values, dims = "pixel")).values
+
+
+
+def build_feature_table(cube, samples, pixels, T = 12, horizon = 3, weather = 'past'):
+    """Combines a cube and the two sample lists returned by make_samples and sample_pixels
+    into a flat table that can be fed to LightGBM, with one row of data per (t0, pixel) combination
+
+    Parameters
+    ----------
+    cube : xr.Dataset
+        Cube with DYNAMIC_VARS, STATIC_VARS, ndmi_anomaly, valid_mask, month_sin, month_cos
+    samples : pd.DataFrame
+        table returned by make_samples, containing t0_idx, t0, split
+    pixels : pd.DataFrame
+        table returned by sample_pixels, with x_idx, y_idx, lat, lon, lc_class, holdout, weight
+    T : int
+        number of previous months a sample has information about
+    horizon : int
+        number of future months the model targets
+    weather : {'past', 'perfect'}
+        if 'perfect' is selected, the actual LEAD_VARS of the target months are added as 
+        input, to simulate what a seasonal forecast would add
+
+    Returns
+    -------
+    table : pd.DataFrame
+        contains the following columns, from left to right:
+        - every column of 'samples' 
+        - every column of 'pixels'
+        - calendar encoded in sin/cos
+        - static variables (elevation, slope, irrigated...)
+        - lagged dynamic variables, referred to as {var}_lag{k}
+        - leads, only if weather == 'perfect', referred to as {var}_lead{k}
+        - target ndmi_anomaly at each horizon, referred to as y_h{h}
+
+
+    Notes
+    -----
+    - key columns (lat, lon, lc_class, weight...) are not all features: lat/lon would
+    let the model memorise location. Select features from static onwards
+    
+
+    """
+
+
+    if weather not in ["past", "perfect"]:
+        raise ValueError(f"weather must be 'past' or 'perfect', got {weather}")
+
+
+    t0 = samples.t0_idx.values
+    n_t = len(t0)
+    n_p = len(pixels)
+
+    # we need a column for each (t0, pixel) point: repeat t0 and tile pixel
+    columns = {}
+    shared = set(samples.columns) & set(pixels.columns)
+    if shared:
+        raise ValueError(f"samples and pixels share column names: {sorted(shared)}")
+    for col in samples.columns:
+        columns[col] = np.repeat(samples[col].values, n_p)
+    for col in pixels.columns:
+        columns[col] = np.tile(pixels[col].values, n_t)
+
+
+    # add encoded calendar
+    for col in ["month_sin", "month_cos"]:
+        columns[col] = np.repeat(cube[col].values[t0].astype(np.float32), n_p)
+
+
+    # add static inputs
+    for col in STATIC_VARS:
+        columns[col] = np.tile(_at_pixels(cube[col], pixels), n_t)
+
+
+    # add dynamic lagged inputs
+    for var in DYNAMIC_VARS:
+        data = _at_pixels(cube[var], pixels).astype(np.float32)
+        for k in range(T):
+            columns[f"{var}_lag{k}"] = data[t0 - k].ravel()
+
+    valid = _at_pixels(cube.valid_mask, pixels).astype(bool)
+    for k in range(T):
+        columns[f"valid_mask_lag{k}"] = valid[t0 - k].ravel().astype(np.uint8)
+
+
+    # add actual weather of the target months (as input, not target, if weather == "perfect")
+    if weather == "perfect":
+        for var in LEAD_VARS:
+            data = _at_pixels(cube[var], pixels).astype(np.float32)
+            for h in range(1, horizon + 1):
+                columns[f"{var}_lead{h}"] = data[t0 + h].ravel()
+
+
+    # add ndmi_anomaly at h months lead as a target
+    y = np.where(valid, _at_pixels(cube.ndmi_anomaly, pixels), np.nan).astype(np.float32)
+    targets = [f"y_h{h}" for h in range(1, horizon + 1)]
+    for h, name in zip(range(1, horizon + 1), targets):
+        columns[name] = y[t0 + h].ravel()
+
+    table = pd.DataFrame(columns)
+
+
+    # mask: keep the held out pixels only for test, and ensure at least one valid target
+    keep = (~(table.holdout & (table.split != "test"))) & table[targets].notna().any(axis = 1)
+    
+    return table[keep].reset_index(drop = True)
+
+
+
+
+
+
+
+
+
 
 
 
