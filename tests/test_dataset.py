@@ -3,6 +3,7 @@ import xarray as xr
 import numpy as np
 from src.dataset import make_samples, SPLITS, split_of_year, land_mask, holdout_mask
 from src.dataset import normalisation_stats, sample_pixels
+from src.dataset import build_feature_table, DYNAMIC_VARS, STATIC_VARS, LEAD_VARS
 import itertools
 import pytest
 import json
@@ -341,6 +342,87 @@ def test_sample_pixels_seed_reproducible():
     c = sample_pixels(ds, land, holdout, frac = .1, min_per_class = 3, seed = 1)
     pd.testing.assert_frame_equal(a, b)
     assert not a.equals(c)
+
+
+
+
+def make_toy_table_cube(n_lat = 4, n_lon = 8, seed = 0):
+    """Toy cube for build_feature_table. Every dynamic variable equals the time index,
+    so lags and leads can be read off directly. The unfilled anomaly is 1000 + time
+    index, so a gap-filled value used as target would be caught. valid_mask has
+    ~30% random gaps (fixed seed)."""
+    n_t = len(TIMES)
+    rng = np.random.default_rng(seed)
+    t_idx = np.broadcast_to(np.arange(n_t, dtype = np.float32)[:, None, None],
+                            (n_t, n_lat, n_lon))
+    dims3, dims2 = ["time", "lat", "lon"], ["lat", "lon"]
+
+    ds = xr.Dataset({v: (dims3, t_idx.copy()) for v in DYNAMIC_VARS},
+                    coords = {"time": TIMES,
+                              "lat": np.linspace(42.1, 41.9, n_lat),
+                              "lon": np.linspace(2.97, 3.19, n_lon)})
+    ds["ndmi_anomaly"] = (dims3, 1000 + t_idx)
+    ds["valid_mask"] = (dims3, (rng.random((n_t, n_lat, n_lon)) > .3).astype(np.uint8))
+    for v in STATIC_VARS:
+        ds[v] = (dims2, np.ones((n_lat, n_lon), dtype = np.float32))
+    ds["landcover"] = (dims2, np.full((n_lat, n_lon), 40, dtype = np.uint8))
+    ds["month_sin"] = ("time", np.sin(2 * np.pi * TIMES.month / 12))
+    ds["month_cos"] = ("time", np.cos(2 * np.pi * TIMES.month / 12))
+    return ds
+
+
+def build_toy_table(weather = "past"):
+    ds = make_toy_table_cube()
+    land = ds.landcover != 0
+    holdout = holdout_mask(ds, frac = .25, tile = 2)
+    pixels = sample_pixels(ds, land, holdout, frac = 1, min_per_class = 1)
+    samples = make_samples(ds.time.values, T = T, horizon = H)
+    return ds, build_feature_table(ds, samples, pixels, T = T, horizon = H, weather = weather)
+
+
+def test_build_feature_table_holdout_only_in_test():
+    _, table = build_toy_table()
+    assert table.holdout.any()
+    assert set(table.loc[table.holdout, "split"]) == {"test"}
+
+
+def test_build_feature_table_target_months_inside_split():
+    _, table = build_toy_table()
+    for h in range(1, H + 1):
+        years = TIMES[table.t0_idx.values + h].year
+        assert (np.array([split_of_year(y) for y in years]) == table.split.values).all()
+
+
+def test_build_feature_table_targets_unfilled_and_masked():
+    ds, table = build_toy_table()
+    for h in range(1, H + 1):
+        t = table.t0_idx.values + h
+        valid = ds.valid_mask.values[t, table.y_idx.values, table.x_idx.values] == 1
+        y = table[f"y_h{h}"].values
+        assert np.isnan(y[~valid]).all()
+        assert (y[valid] == 1000 + t[valid]).all()
+
+
+def test_build_feature_table_lags_match_time_index():
+    _, table = build_toy_table()
+    for k in (0, 3, T - 1):
+        assert (table[f"ndmi_anomaly_filled_lag{k}"] == table.t0_idx - k).all()
+    assert f"ndmi_anomaly_filled_lag{T}" not in table
+
+
+def test_build_feature_table_lead_columns_only_with_perfect_weather():
+    _, past = build_toy_table("past")
+    _, perfect = build_toy_table("perfect")
+    assert not any("_lead" in c for c in past.columns)
+    leads = {c for c in perfect.columns if "_lead" in c}
+    assert leads == {f"{v}_lead{h}" for v in LEAD_VARS for h in range(1, H + 1)}
+    assert (perfect.tp_lead2 == perfect.t0_idx + 2).all()
+
+
+def test_build_feature_table_rejects_unknown_weather():
+    ds = make_toy_table_cube()
+    with pytest.raises(ValueError):
+        build_feature_table(ds, make_samples(ds.time.values), pd.DataFrame(), weather = "future")
 
 
 
